@@ -2,7 +2,7 @@
 
 Self-Supervised Representation Learning on Point Clouds
 
-[[`Paper`](https://arxiv.org/abs/2303.16570v1)] [[`Project`](https://point2vec.ka.codes)] [[`BibTeX`](#citing-point2vec)]
+[[`Paper`](https://arxiv.org/abs/2303.16570v1)] [[`Project`](https://vision.rwth-aachen.de/point2vec)] [[`BibTeX`](#citing-point2vec)]
 
 ![architecture](https://user-images.githubusercontent.com/7303830/229210206-3df19b2c-f0bf-46ee-b0c2-d1ec1a3123d4.png)
 
@@ -36,10 +36,10 @@ python -m point2vec.datasets.process.check # check if datasets are complete
 
 | Type                         | Dataset      | Evaluation                          | Config                                                                                       | Checkpoint                                                                                                                                    |
 | ---------------------------- | ------------ | ----------------------------------- | -------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| Point2vec pre-trained        | ShapeNet     | -                                   | [config](configs/pretraining/shapenet.yaml)                                                  | [checkpoint](https://github.com/kabouzeid/point2vec/releases/download/paper/pre_point2vec-epoch.799-step.64800.ckpt)                          |
-| Classification fine-tuned    | ModelNet40   | **94.65** / **94.77** (OA / Voting) | [A](configs/classification/modelnet40.yaml) & [B](configs/classification/_pretrained.yaml)   | [checkpoint](https://github.com/kabouzeid/point2vec/releases/download/paper/fine_modelnet40-epoch.125-step.38682-val_acc.0.9465.ckpt)         |
-| Classification fine-tuned    | ScanObjectNN | **87.47** (OA)                      | [A](configs/classification/scanobjectnn.yaml) & [B](configs/classification/_pretrained.yaml) | [checkpoint](https://github.com/kabouzeid/point2vec/releases/download/paper/fine_scanobjectnn-epoch.146-step.52332-val_acc.0.8747.ckpt)       |
-| Part segmentation fine-tuned | ShapeNetPart | **84.59** (Cat. mIoU)               | [config](configs/part_segmentation/shapenetpart.yaml)                                        | [checkpoint](https://github.com/kabouzeid/point2vec/releases/download/paper/fine_shapenetpart-epoch.288-step.252586-val_cat_miou.0.8459.ckpt) |
+| Point2vec pre-trained        | ShapeNet     | -                                   | [config](configs/pretraining/shapenet.yaml)                                                  | [checkpoint](https://github.com/karimknaebel/point2vec/releases/download/paper/pre_point2vec-epoch.799-step.64800.ckpt)                          |
+| Classification fine-tuned    | ModelNet40   | **94.65** / **94.77** (OA / Voting) | [A](configs/classification/modelnet40.yaml) & [B](configs/classification/_pretrained.yaml)   | [checkpoint](https://github.com/karimknaebel/point2vec/releases/download/paper/fine_modelnet40-epoch.125-step.38682-val_acc.0.9465.ckpt)         |
+| Classification fine-tuned    | ScanObjectNN | **87.47** (OA)                      | [A](configs/classification/scanobjectnn.yaml) & [B](configs/classification/_pretrained.yaml) | [checkpoint](https://github.com/karimknaebel/point2vec/releases/download/paper/fine_scanobjectnn-epoch.146-step.52332-val_acc.0.8747.ckpt)       |
+| Part segmentation fine-tuned | ShapeNetPart | **84.59** (Cat. mIoU)               | [config](configs/part_segmentation/shapenetpart.yaml)                                        | [checkpoint](https://github.com/karimknaebel/point2vec/releases/download/paper/fine_shapenetpart-epoch.288-step.252586-val_cat_miou.0.8459.ckpt) |
 
 ## Reproducing the results from the paper
 
@@ -65,7 +65,7 @@ Using our _exact_ environment is necessary to ensure that you obtain the same ra
 
 </details>
 
-[[`Checkpoint`](https://github.com/kabouzeid/point2vec/releases/download/paper/pre_point2vec-epoch.799-step.64800.ckpt)]
+[[`Checkpoint`](https://github.com/karimknaebel/point2vec/releases/download/paper/pre_point2vec-epoch.799-step.64800.ckpt)]
 
 ### Classification fine-tuning on ScanObjectNN
 
@@ -82,7 +82,7 @@ Replace `XXXXXXXX` with the `WANDB_RUN_ID` from the pre-training run, or use the
 
 </details>
 
-[[`Checkpoint`](https://github.com/kabouzeid/point2vec/releases/download/paper/fine_scanobjectnn-epoch.146-step.52332-val_acc.0.8747.ckpt)]
+[[`Checkpoint`](https://github.com/karimknaebel/point2vec/releases/download/paper/fine_scanobjectnn-epoch.146-step.52332-val_acc.0.8747.ckpt)]
 
 ### Classification fine-tuning on ModelNet40
 
@@ -99,7 +99,7 @@ Replace `XXXXXXXX` with the `WANDB_RUN_ID` from the pre-training run, or use the
 
 </details>
 
-[[`Checkpoint`](https://github.com/kabouzeid/point2vec/releases/download/paper/fine_modelnet40-epoch.125-step.38682-val_acc.0.9465.ckpt)]
+[[`Checkpoint`](https://github.com/karimknaebel/point2vec/releases/download/paper/fine_modelnet40-epoch.125-step.38682-val_acc.0.9465.ckpt)]
 
 ### Voting on ModelNet40
 
@@ -143,7 +143,7 @@ Replace `XXXXXXXX` with the `WANDB_RUN_ID` from the pre-training run, or use the
 
 </details>
 
-[[`Checkpoint`](https://github.com/kabouzeid/point2vec/releases/download/paper/fine_shapenetpart-epoch.288-step.252586-val_cat_miou.0.8459.ckpt)]
+[[`Checkpoint`](https://github.com/karimknaebel/point2vec/releases/download/paper/fine_shapenetpart-epoch.288-step.252586-val_cat_miou.0.8459.ckpt)]
 
 ### Baselines
 
@@ -161,7 +161,7 @@ Replace the pre-training step with:
 
 If you only have a single GPU (and enough VRAM), you may replace `--trainer.devices 2 --data.batch_size 1024 --model.fix_estimated_stepping_batches 16000` with `--data.batch_size 2048`.
 
-[[`Checkpoint`](https://github.com/kabouzeid/point2vec/releases/download/paper/pre_data2vec-epoch.799-step.16000.ckpt)]
+[[`Checkpoint`](https://github.com/karimknaebel/point2vec/releases/download/paper/pre_data2vec-epoch.799-step.16000.ckpt)]
 
 #### From scratch
 
@@ -183,7 +183,7 @@ If you use point2vec in your research, please use the following BibTeX entry.
 ```
 @inproceedings{abouzeid2023point2vec,
   title={Point2Vec for Self-Supervised Representation Learning on Point Clouds},
-  author={Abou Zeid, Karim and Schult, Jonas and Hermans, Alexander and Leibe, Bastian},
+  author={Knaebel, Karim and Schult, Jonas and Hermans, Alexander and Leibe, Bastian},
   journal={German Conference on Pattern Recognition (GCPR)},
   year={2023},
 }
