@@ -4,6 +4,7 @@ import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import chamfer # recon_update_1
 from pl_bolts.optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
 from pytorch_lightning.loggers import WandbLogger
 from sklearn.svm import SVC
@@ -46,6 +47,7 @@ class Point2Vec(pl.LightningModule):
         d2v_ema_tau_epochs: int = 200,
         loss: str = "smooth_l1",  # smooth_l1, mse
         learning_rate: float = 1e-3,
+        recon_cd_lambda: float = 0.2, # recon_update_1: lambda for chamfer distance loss.
         optimizer_adamw_weight_decay: float = 0.05,
         lr_scheduler_linear_warmup_epochs: int = 80,
         lr_scheduler_linear_warmup_start_lr: float = 1e-6,
@@ -171,6 +173,11 @@ class Point2Vec(pl.LightningModule):
                 self.loss_func = nn.SmoothL1Loss(beta=2)
             case _:
                 raise ValueError(f"Unknown loss: {loss}")
+            
+        # recon_update_1: initialize chamfer distance loss lambda and function    
+        self.recon_cd_lambda = recon_cd_lambda
+        self.recon_group_size = tokenizer_group_size
+        self.recon_head = nn.Linear(encoder_dim, tokenizer_group_size * 3)
 
     def setup(self, stage: Optional[str] = None) -> None:
         self.teacher = EMA(
@@ -214,10 +221,12 @@ class Point2Vec(pl.LightningModule):
         embeddings: torch.Tensor,
         centers: torch.Tensor,
         mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        points: torch.Tensor # recon_update_1
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: # recon_update_1
         # tokens: (B, T, C)
         # centers: (B, T, 3)
         # mask: (B, T)
+        # points: (B, N, 3) # recon_update_1
 
         w = mask.unsqueeze(-1).type_as(embeddings)
         corrupted_embeddings = (1 - w) * embeddings + w * self.mask_token
@@ -242,6 +251,75 @@ class Point2Vec(pl.LightningModule):
             predictions = self.regressor(
                 decoder_output_tokens[:, -masked_embeddings.shape[1] :].reshape(-1, C)
             )
+
+            # --- Chamfer reconstruction loss (ALL tokens) ---  # recon_update_2
+            B, T, C = embeddings.shape
+            K = self.recon_group_size
+
+            V = visible_embeddings.shape[1]
+            M = masked_embeddings.shape[1]
+
+            # decoder_output_tokens: (B, V+M, C) where first V are visible (~mask order), last M are masked (mask order)
+            dec_vis = decoder_output_tokens[:, :V, :]   # (B, V, C)
+            dec_msk = decoder_output_tokens[:, V:, :]   # (B, M, C)
+
+            # restore to original token order (B, T, C)
+            dec_all = torch.zeros((B, T, C), device=decoder_output_tokens.device, dtype=decoder_output_tokens.dtype)
+            dec_all[~mask] = dec_vis.reshape(-1, C).to(dec_all.dtype)
+            dec_all[mask] = dec_msk.reshape(-1, C).to(dec_all.dtype)
+
+            # predict relative patch points from ALL tokens: (B, T, K, 3)
+            pred_rel = self.recon_head(dec_all).view(B, T, K, 3)
+
+            # if group_radius is set, tokenizer grouped points were divided by radius -> scale back
+            radius = self.hparams.tokenizer_group_radius  # may be None
+            if radius is not None:
+                pred_rel = pred_rel * radius
+
+            # absolute predicted points: add centers -> (B, T, K, 3) -> (B, T*K, 3)
+            pred_pts = (pred_rel + centers.unsqueeze(2)).reshape(B, T * K, 3)
+
+            # GT full cloud: (B, N, 3)
+            gt_pts = points[:, :, :3]
+
+            # chamfer extension is safest in fp32 (especially with AMP)
+            with torch.cuda.amp.autocast(enabled=False):
+                pred_pts_f = pred_pts.float().contiguous()
+                gt_pts_f = gt_pts.float().contiguous()
+                dist1, dist2, _, _ = chamfer.forward(pred_pts_f, gt_pts_f)
+                recon_cd_loss = dist1.mean() + dist2.mean()
+            # -------------------------------------------------------
+
+            # ---------- TensorBoard point cloud logging (pred vs gt) ---------- # recon_update_2
+            log_every = 10000  # log every 10000 steps
+            if (
+                self.logger is not None
+                and hasattr(self.logger, "experiment")
+                and (self.global_step % log_every == 0)
+            ):
+                try:
+                    # log 1. batch 
+                    pred0 = pred_pts[:1].detach().float().cpu()  # (1, P, 3)
+                    gt0 = gt_pts[:1].detach().float().cpu()      # (1, N, 3)
+
+                    # pred red，gt green
+                    verts = torch.cat([pred0, gt0], dim=1)  # (1, P+N, 3)
+
+                    red = torch.tensor([1.0, 0.0, 0.0]).view(1, 1, 3).repeat(1, pred0.shape[1], 1)
+                    green = torch.tensor([0.0, 1.0, 0.0]).view(1, 1, 3).repeat(1, gt0.shape[1], 1)
+                    colors = torch.cat([red, green], dim=1)  # (1, P+N, 3)
+
+                    self.logger.experiment.add_mesh(
+                        "pc/pred_vs_gt",
+                        vertices=verts,
+                        colors=colors,
+                        global_step=self.global_step,
+                    )
+                except Exception as e:
+
+                    pass
+            # ---------------------------------------------------------------------
+
         else:  # no decoder => like data2vec
             pos = self.positional_encoding(centers)
             output_embeddings = self.student(
@@ -251,23 +329,35 @@ class Point2Vec(pl.LightningModule):
 
         targets = self.generate_targets(embeddings, pos)[mask]
 
-        return predictions, targets
+        # If running without decoder (data2vec-style), there is no recon loss
+        if not self.hparams.decoder:  # type: ignore
+            recon_cd_loss = torch.zeros((), device=embeddings.device, dtype=embeddings.dtype)
 
-    def _perform_step(self, inputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        return predictions, targets, recon_cd_loss
+
+    def _perform_step(self, inputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # inputs: (B, N, 3)
         tokens, centers = self.tokenizer(inputs)  # (B, T, C), (B, T, 3)
         mask = self.masking(centers)  # (B, T)
-        return self.forward(tokens, centers, mask)
+        return self.forward(tokens, centers, mask, inputs)  # recon_update_1
 
     def training_step(self, batch, batch_idx: int) -> torch.Tensor:
         # inputs: (B, N, 3)
         points, _ = batch
         points = self.train_transformations(points)
-        x, y = self._perform_step(points)
-        loss = self.loss_func(x, y)
-        self.log("train_loss", loss, on_epoch=True)
-        self.log("train_pred_std", self.token_std(x))  # should always be > 0.01
-        self.log("train_target_std", self.token_std(y))  # should always be > 0.1
+
+        #---------recon_update_1: get recon_cd_loss from forward pass---------#
+        x, y, recon_cd_loss = self._perform_step(points)
+        ssl_loss = self.loss_func(x, y)
+        loss = ssl_loss + self.recon_cd_lambda * recon_cd_loss
+
+        self.log("train_ssl_loss", ssl_loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log("train_recon_cd_loss", recon_cd_loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+
+        self.log("train_pred_std", self.token_std(x))
+        self.log("train_target_std", self.token_std(y))
+        #-------------------------------------------------------------------------#
         return loss
 
     def validation_step(
@@ -276,11 +366,17 @@ class Point2Vec(pl.LightningModule):
         # inputs: (B, N, 3)
         points, _ = batch
         points = self.val_transformations(points)
-        x, y = self._perform_step(points)
-        loss = self.loss_func(x, y)
-        self.log("val_loss", loss)
+        x, y, recon_cd_loss  = self._perform_step(points)
+        #---------recon_update_1: get recon_cd_loss from forward pass---------#
+        ssl_loss = self.loss_func(x, y)
+        loss = ssl_loss + self.recon_cd_lambda * recon_cd_loss
+        self.log("val_ssl_loss", ssl_loss, on_epoch=True, prog_bar=True)
+        self.log("val_recon_cd_loss", recon_cd_loss, on_epoch=True, prog_bar=True)
+        self.log("val_loss", loss, on_epoch=True, prog_bar=True)
+
         self.log("val_pred_std", self.token_std(x))
         self.log("val_target_std", self.token_std(y))
+        #-------------------------------------------------------------------------#
 
     def validation_epoch_end(
         self, outputs: List[Tuple[torch.Tensor, torch.Tensor]]
