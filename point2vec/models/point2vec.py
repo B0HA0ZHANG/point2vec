@@ -290,33 +290,37 @@ class Point2Vec(pl.LightningModule):
                 recon_cd_loss = dist1.mean() + dist2.mean()
             # -------------------------------------------------------
 
-            # ---------- TensorBoard point cloud logging (pred vs gt) ---------- # recon_update_2
+            # ---------- TensorBoard point cloud logging (pred vs gt) ----------
             log_every = 10000  # log every 10000 steps
             if (
-                self.logger is not None
+                self.training
+                and self.logger is not None
                 and hasattr(self.logger, "experiment")
                 and (self.global_step % log_every == 0)
             ):
                 try:
-                    # log 1. batch 
+                    writer = self.logger.experiment
+
+                    # log first sample in the batch
                     pred0 = pred_pts[:1].detach().float().cpu()  # (1, P, 3)
                     gt0 = gt_pts[:1].detach().float().cpu()      # (1, N, 3)
 
-                    # pred red，gt green
-                    verts = torch.cat([pred0, gt0], dim=1)  # (1, P+N, 3)
+                    # (optional) limit points to avoid huge logs
+                    Pmax = 4096
+                    if pred0.shape[1] > Pmax:
+                        pred0 = pred0[:, :Pmax, :]
+                    if gt0.shape[1] > Pmax:
+                        gt0 = gt0[:, :Pmax, :]
 
-                    red = torch.tensor([1.0, 0.0, 0.0]).view(1, 1, 3).repeat(1, pred0.shape[1], 1)
-                    green = torch.tensor([0.0, 1.0, 0.0]).view(1, 1, 3).repeat(1, gt0.shape[1], 1)
-                    colors = torch.cat([red, green], dim=1)  # (1, P+N, 3)
+                    # Use uint8 colors [0,255] to ensure TensorBoard shows colors correctly
+                    pred_col = torch.zeros_like(pred0, dtype=torch.uint8)
+                    pred_col[..., 0] = 255  # red
+                    gt_col = torch.full_like(gt0, 160, dtype=torch.uint8)  # grey
 
-                    self.logger.experiment.add_mesh(
-                        "pc/pred_vs_gt",
-                        vertices=verts,
-                        colors=colors,
-                        global_step=self.global_step,
-                    )
-                except Exception as e:
+                    writer.add_mesh("pc/pred", vertices=pred0, colors=pred_col, global_step=self.global_step)
+                    writer.add_mesh("pc/gt", vertices=gt0, colors=gt_col, global_step=self.global_step)
 
+                except Exception:
                     pass
             # ---------------------------------------------------------------------
 
