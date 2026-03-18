@@ -48,6 +48,7 @@ class Point2Vec(pl.LightningModule):
         loss: str = "smooth_l1",  # smooth_l1, mse
         learning_rate: float = 1e-3,
         recon_cd_lambda: float = 0.2, # recon_update_1: lambda for chamfer distance loss.
+        global_mse_lambda: float = 1.0, # update_2: lambda for global MSE loss.
         optimizer_adamw_weight_decay: float = 0.05,
         lr_scheduler_linear_warmup_epochs: int = 80,
         lr_scheduler_linear_warmup_start_lr: float = 1e-6,
@@ -173,12 +174,17 @@ class Point2Vec(pl.LightningModule):
                 self.loss_func = nn.SmoothL1Loss(beta=2)
             case _:
                 raise ValueError(f"Unknown loss: {loss}")
-            
-        # recon_update_1: initialize chamfer distance loss lambda and function    
+
+        self.global_mse_lambda = global_mse_lambda  # update_2: initialize global MSE loss lambda
+
+        #recon_update_1: initialize chamfer distance loss lambda and function    
         self.recon_cd_lambda = recon_cd_lambda
         self.recon_group_size = tokenizer_group_size
-        self.recon_head = nn.Linear(encoder_dim, tokenizer_group_size * 3)
-
+        if decoder:
+            self.recon_head = nn.Linear(encoder_dim, tokenizer_group_size * 3)
+        else:
+            self.recon_head = None
+    
     def setup(self, stage: Optional[str] = None) -> None:
         self.teacher = EMA(
             self.student,
@@ -222,7 +228,7 @@ class Point2Vec(pl.LightningModule):
         centers: torch.Tensor,
         mask: torch.Tensor,
         points: torch.Tensor # recon_update_1
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: # recon_update_1
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: # recon_update_1 # update_2
         # tokens: (B, T, C)
         # centers: (B, T, 3)
         # mask: (B, T)
@@ -239,10 +245,11 @@ class Point2Vec(pl.LightningModule):
             pos = self.positional_encoding(centers)
             visible_pos = pos[~mask].reshape(B, -1, C)
             masked_pos = pos[mask].reshape(B, -1, C)
+            # student encoder output
             output_embeddings = self.student(
                 visible_embeddings, visible_pos
             ).last_hidden_state  # (B, T, C)
-
+            # oringinal Point2Vec masked-token branch
             decoder_output_tokens = self.decoder(
                 torch.cat([output_embeddings, masked_embeddings], dim=1),
                 torch.cat([visible_pos, masked_pos], dim=1),
@@ -251,6 +258,26 @@ class Point2Vec(pl.LightningModule):
             predictions = self.regressor(
                 decoder_output_tokens[:, -masked_embeddings.shape[1] :].reshape(-1, C)
             )
+
+            # update_2: teacher token targets (full tokens)
+            targets_full = self.generate_targets(embeddings, pos)  # (B, T, C)
+            targets = targets_full[mask]
+
+            # -------- global MSE branch -------- # update2
+            #student global from visible tokens
+            student_global = torch.cat([output_embeddings.max(dim=1).values, output_embeddings.mean(dim=1),], dim=-1,
+            )  # (B, 2C)
+
+            # teacher global from full tokens
+            teacher_global = torch.cat([targets_full.max(dim=1).values, targets_full.mean(dim=1),], dim=-1,
+            )  # (B, 2C)
+
+            # normalize before MSE
+            student_global = F.layer_norm(student_global, student_global.shape[-1:])
+            teacher_global = F.layer_norm(teacher_global, teacher_global.shape[-1:])
+            global_mse_loss = F.mse_loss(student_global, teacher_global)
+
+            # -----------------------------------
 
             # --- Chamfer reconstruction loss (ALL tokens) ---  # recon_update_2
             B, T, C = embeddings.shape
@@ -329,34 +356,47 @@ class Point2Vec(pl.LightningModule):
             output_embeddings = self.student(
                 corrupted_embeddings, pos
             ).last_hidden_state  # (B, T, C)
+
             predictions = self.regressor(output_embeddings[mask])
+            #targets = self.generate_targets(embeddings, pos)[mask]
+            targets_full = self.generate_targets(embeddings, pos)
+            targets = targets_full[mask]
 
-        targets = self.generate_targets(embeddings, pos)[mask]
+            # global branch for no-decoder branch
+            student_global = torch.cat([output_embeddings.max(dim=1).values, output_embeddings.mean(dim=1),], dim=-1,
+            )
+            teacher_global = torch.cat([targets_full.max(dim=1).values, targets_full.mean(dim=1),], dim=-1,
+            )
+            student_global = F.layer_norm(student_global, student_global.shape[-1:])
+            teacher_global = F.layer_norm(teacher_global, teacher_global.shape[-1:])
+            global_mse_loss = F.mse_loss(student_global, teacher_global)
 
-        # If running without decoder (data2vec-style), there is no recon loss
-        if not self.hparams.decoder:  # type: ignore
-            recon_cd_loss = torch.zeros((), device=embeddings.device, dtype=embeddings.dtype)
+        return predictions, targets, global_mse_loss, recon_cd_loss # update_2
 
-        return predictions, targets, recon_cd_loss
-
-    def _perform_step(self, inputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _perform_step(self, inputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:#, torch.Tensor, torch.Tensor]:
         # inputs: (B, N, 3)
         tokens, centers = self.tokenizer(inputs)  # (B, T, C), (B, T, 3)
         mask = self.masking(centers)  # (B, T)
-        return self.forward(tokens, centers, mask, inputs)  # recon_update_1
+        return self.forward(tokens, centers, mask, inputs)  # recon_update_1 # update_2
 
     def training_step(self, batch, batch_idx: int) -> torch.Tensor:
         # inputs: (B, N, 3)
         points, _ = batch
         points = self.train_transformations(points)
 
-        #---------recon_update_1: get recon_cd_loss from forward pass---------#
-        x, y, recon_cd_loss = self._perform_step(points)
+        #---------recon_update_1: get recon_cd_loss from forward pass---------# #---------update_2: add global_mse_loss---------#
+        #x, y, recon_cd_loss = self._perform_step(points)
+        x, y, global_mse_loss, recon_cd_loss = self._perform_step(points)
+        #x, y, global_mse_loss = self._perform_step(points)
+        #x, y = self._perform_step(points)
         ssl_loss = self.loss_func(x, y)
-        loss = ssl_loss + self.recon_cd_lambda * recon_cd_loss
+        #loss = ssl_loss + self.recon_cd_lambda * recon_cd_loss
+        loss = ssl_loss + self.global_mse_lambda * global_mse_loss + self.recon_cd_lambda * recon_cd_loss  # type: ignore
+
 
         self.log("train_ssl_loss", ssl_loss, on_step=True, on_epoch=True, prog_bar=True)
         self.log("train_recon_cd_loss", recon_cd_loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log("train_global_mse_loss", global_mse_loss, on_step=True, on_epoch=True, prog_bar=True)
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
 
         self.log("train_pred_std", self.token_std(x))
@@ -370,12 +410,19 @@ class Point2Vec(pl.LightningModule):
         # inputs: (B, N, 3)
         points, _ = batch
         points = self.val_transformations(points)
-        x, y, recon_cd_loss  = self._perform_step(points)
-        #---------recon_update_1: get recon_cd_loss from forward pass---------#
+
+        #---------recon_update_1: get recon_cd_loss from forward pass---------# #---------update_2: add global_mse_loss---------#
+        #x, y, recon_cd_loss  = self._perform_step(points)
+        x, y, global_mse_loss, recon_cd_loss = self._perform_step(points)
+        #x, y = self._perform_step(points)
+        #x, y, global_mse_loss = self._perform_step(points)
         ssl_loss = self.loss_func(x, y)
-        loss = ssl_loss + self.recon_cd_lambda * recon_cd_loss
+        #loss = ssl_loss + self.recon_cd_lambda * recon_cd_loss
+        loss = ssl_loss + self.global_mse_lambda * global_mse_loss + self.recon_cd_lambda * recon_cd_loss  # type: ignore
+
         self.log("val_ssl_loss", ssl_loss, on_epoch=True, prog_bar=True)
         self.log("val_recon_cd_loss", recon_cd_loss, on_epoch=True, prog_bar=True)
+        self.log("val_global_mse_loss", global_mse_loss, on_epoch=True, prog_bar=True)
         self.log("val_loss", loss, on_epoch=True, prog_bar=True)
 
         self.log("val_pred_std", self.token_std(x))
@@ -385,6 +432,8 @@ class Point2Vec(pl.LightningModule):
     def validation_epoch_end(
         self, outputs: List[Tuple[torch.Tensor, torch.Tensor]]
     ) -> None:
+        print(">>> entered validation_epoch_end")
+        print(">>> svm_validation keys:", list(self.hparams.svm_validation.keys()))
         svm_validation: Dict[str, pl.LightningDataModule] = self.hparams.svm_validation  # type: ignore
         for dataset_name, datamodule in svm_validation.items():
             svm_train_acc, svm_val_acc = self.svm_validation(datamodule)
@@ -393,6 +442,7 @@ class Point2Vec(pl.LightningModule):
 
     def svm_validation(self, datamodule: pl.LightningDataModule) -> Tuple[float, float]:
         # Lightning controls the `training` and `grad_enabled` state. Don't want to mess with it, but make sure it's correct.
+        print(">>> starting svm validation")
         assert not self.training
         assert not torch.is_grad_enabled()
 
@@ -424,6 +474,7 @@ class Point2Vec(pl.LightningModule):
         svm.fit(x_train, y_train)  # type: ignore
         train_acc: float = svm.score(x_train, y_train)  # type: ignore
         val_acc: float = svm.score(x_val, y_val)  # type: ignore
+        print(">>> finished svm validation")
         return train_acc, val_acc
 
     # https://github.com/Lightning-AI/lightning/issues/11688#issuecomment-1026688558

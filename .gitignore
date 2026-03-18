@@ -172,3 +172,5 @@ cython_debug/
 /wandb
 pyrightconfig.json
 .vscode
+point2vec-Pretraining-ShapeNet/
+point2vec-Classification-ScanObjectNN/
