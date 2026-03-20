@@ -125,6 +125,7 @@ class Block(nn.Module):
 @dataclass()
 class TransformerEncoderOutput:
     last_hidden_state: torch.Tensor  # (B, T, C)
+    cls_hidden_state: Optional[torch.Tensor] = None  # (B, C) # Update_3: ViT like
     hidden_states: Optional[List[torch.Tensor]] = None  # [(B, T, C)]
     attentions: Optional[List[torch.Tensor]] = None  # [(B, H, T)]
     ffns: Optional[List[torch.Tensor]] = None  # [(B, T, C)]
@@ -196,4 +197,5 @@ class TransformerEncoder(nn.Module):
                 assert ffns is not None
                 ffns.append(ffn)
         x = self.norm(x)
-        return TransformerEncoderOutput(x, hidden_states, attentions, ffns)
+        cls_hidden_state = x[:, 0] if x.shape[1] > 0 else None  # Update_3: ViT like
+        return TransformerEncoderOutput(x, cls_hidden_state, hidden_states, attentions, ffns)

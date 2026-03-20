@@ -4,6 +4,7 @@ import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import wandb
 import chamfer # recon_update_1
 from pl_bolts.optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
 from pytorch_lightning.loggers import WandbLogger
@@ -48,7 +49,9 @@ class Point2Vec(pl.LightningModule):
         loss: str = "smooth_l1",  # smooth_l1, mse
         learning_rate: float = 1e-3,
         recon_cd_lambda: float = 0.2, # recon_update_1: lambda for chamfer distance loss.
-        global_mse_lambda: float = 1.0, # update_2: lambda for global MSE loss.
+        cls_ce_lambda: float = 0.2, # Update_3
+        cls_ce_temperature_s: float = 0.1, # Update_3
+        cls_ce_temperature_t: float = 0.04, # Update_3
         optimizer_adamw_weight_decay: float = 0.05,
         lr_scheduler_linear_warmup_epochs: int = 80,
         lr_scheduler_linear_warmup_start_lr: float = 1e-6,
@@ -127,9 +130,14 @@ class Point2Vec(pl.LightningModule):
         nn.init.trunc_normal_(
             self.mask_token, mean=0, std=init_std, a=-init_std, b=init_std
         )
-        # self.cls_token = nn.Parameter(torch.zeros(encoder_dim))
-        # nn.init.trunc_normal_(self.cls_token, mean=0, std=init_std, a=-init_std, b=init_std)
+        # Update_3: add cls token for ViT like architecture---------
+        self.cls_token = nn.Parameter(torch.zeros(encoder_dim))
+        nn.init.trunc_normal_(self.cls_token, mean=0, std=init_std, a=-init_std, b=init_std)
 
+        self.cls_pos = nn.Parameter(torch.zeros(encoder_dim))
+        nn.init.trunc_normal_(self.cls_pos, mean=0, std=init_std, a=-init_std, b=init_std)
+        self.cls_head = nn.Linear(encoder_dim, encoder_dim)
+        #-----------------------------------------------------------
         dpr = [
             x.item() for x in torch.linspace(0, encoder_drop_path_rate, encoder_depth)
         ]
@@ -174,8 +182,11 @@ class Point2Vec(pl.LightningModule):
                 self.loss_func = nn.SmoothL1Loss(beta=2)
             case _:
                 raise ValueError(f"Unknown loss: {loss}")
-
-        self.global_mse_lambda = global_mse_lambda  # update_2: initialize global MSE loss lambda
+            
+        # Update_3: keep separate student and teacher temperatures for cls distillation.
+        self.cls_ce_lambda = cls_ce_lambda
+        self.cls_ce_temperature_s = cls_ce_temperature_s
+        self.cls_ce_temperature_t = cls_ce_temperature_t
 
         #recon_update_1: initialize chamfer distance loss lambda and function    
         self.recon_cd_lambda = recon_cd_lambda
@@ -211,6 +222,8 @@ class Point2Vec(pl.LightningModule):
             datamodule.setup("fit")
             for logger in self.loggers:
                 if isinstance(logger, WandbLogger):
+                    logger.experiment.define_metric("train/*", step_metric="trainer/global_step")
+                    logger.experiment.define_metric("val/*", step_metric="trainer/global_step")
                     logger.experiment.define_metric(
                         f"svm_train_acc_{dataset_name}", summary="last,max"
                     )
@@ -222,13 +235,78 @@ class Point2Vec(pl.LightningModule):
             if isinstance(logger, WandbLogger):
                 logger.watch(self)
 
+    # Update_4: add point cloud log helper for W&B validation visualization.
+    def _get_wandb_logger(self) -> Optional[WandbLogger]:
+        for logger in self.loggers:
+            if isinstance(logger, WandbLogger):
+                return logger
+        return None
+
+    # Update_3: prepend cls token and its positional embedding for ViT-like encoding.
+    def append_cls_token(
+        self,
+        tokens: torch.Tensor,
+        pos: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        B, _, C = tokens.shape
+        cls_token = self.cls_token.reshape(1, 1, C).expand(B, -1, -1)
+        cls_pos = self.cls_pos.reshape(1, 1, C).expand(B, -1, -1)
+        tokens = torch.cat([cls_token, tokens], dim=1)
+        pos = torch.cat([cls_pos, pos], dim=1)
+        return tokens, pos
+
+    # Update_3: use asymmetric temperatures to sharpen teacher targets and smooth student logits.
+    def cls_distillation_loss(
+        self,
+        student_cls: torch.Tensor,
+        teacher_cls: torch.Tensor,
+    ) -> torch.Tensor:
+        temperature_t = self.cls_ce_temperature_t
+        temperature_s = self.cls_ce_temperature_s
+
+        student_logits = self.cls_head(student_cls) / temperature_s
+        with torch.no_grad():
+            teacher_logits = self.cls_head(teacher_cls) / temperature_t
+            teacher_prob = F.softmax(teacher_logits, dim=-1)
+
+        student_log_prob = F.log_softmax(student_logits, dim=-1)
+        loss = -(teacher_prob * student_log_prob).sum(dim=-1).mean()
+        return loss * (temperature_s ** 2)
+
+    # Update_4: add point cloud log helper to compare input, prediction, and GT in W&B.
+    def log_point_clouds(
+        self,
+        input_pts: torch.Tensor,
+        pred_pts: torch.Tensor,
+        gt_pts: torch.Tensor,
+    ) -> None:
+        wandb_logger = self._get_wandb_logger()
+        if wandb_logger is None:
+            return
+
+        def limit_points(points: torch.Tensor) -> torch.Tensor:
+            points = points[0].detach().float().cpu()
+            if points.shape[0] > 4096:
+                points = points[:4096]
+            return points
+
+        wandb_logger.experiment.log(
+            {
+                "val/input_pc": wandb.Object3D(limit_points(input_pts).numpy()),
+                "val/pred_pc": wandb.Object3D(limit_points(pred_pts).numpy()),
+                "val/gt_pc": wandb.Object3D(limit_points(gt_pts).numpy()),
+                "trainer/global_step": self.global_step,
+                "epoch": self.current_epoch,
+            }
+        )
+
     def forward(
         self,
         embeddings: torch.Tensor,
         centers: torch.Tensor,
         mask: torch.Tensor,
         points: torch.Tensor # recon_update_1
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: # recon_update_1 # update_2
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[Dict[str, torch.Tensor]]]: # recon_update_1 # update_2
         # tokens: (B, T, C)
         # centers: (B, T, 3)
         # mask: (B, T)
@@ -236,6 +314,9 @@ class Point2Vec(pl.LightningModule):
 
         w = mask.unsqueeze(-1).type_as(embeddings)
         corrupted_embeddings = (1 - w) * embeddings + w * self.mask_token
+
+        recon_cd_loss = embeddings.new_zeros(())
+        vis_dict: Optional[Dict[str, torch.Tensor]] = None
 
         if self.hparams.decoder:  # type: ignore
             B, _, C = embeddings.shape
@@ -246,9 +327,12 @@ class Point2Vec(pl.LightningModule):
             visible_pos = pos[~mask].reshape(B, -1, C)
             masked_pos = pos[mask].reshape(B, -1, C)
             # student encoder output
-            output_embeddings = self.student(
-                visible_embeddings, visible_pos
-            ).last_hidden_state  # (B, T, C)
+            student_tokens, student_pos = self.append_cls_token(visible_embeddings, visible_pos)
+            student_output = self.student(student_tokens, student_pos)
+            student_encoded = student_output.last_hidden_state
+            student_cls = student_encoded[:, 0]
+            output_embeddings = student_encoded[:, 1:]
+
             # oringinal Point2Vec masked-token branch
             decoder_output_tokens = self.decoder(
                 torch.cat([output_embeddings, masked_embeddings], dim=1),
@@ -258,26 +342,10 @@ class Point2Vec(pl.LightningModule):
             predictions = self.regressor(
                 decoder_output_tokens[:, -masked_embeddings.shape[1] :].reshape(-1, C)
             )
-
-            # update_2: teacher token targets (full tokens)
-            targets_full = self.generate_targets(embeddings, pos)  # (B, T, C)
+            # Update_3: keep masked-token regression and add cls-token distillation.
+            targets_full, teacher_cls = self.generate_targets(embeddings, pos)
             targets = targets_full[mask]
-
-            # -------- global MSE branch -------- # update2
-            #student global from visible tokens
-            student_global = torch.cat([output_embeddings.max(dim=1).values, output_embeddings.mean(dim=1),], dim=-1,
-            )  # (B, 2C)
-
-            # teacher global from full tokens
-            teacher_global = torch.cat([targets_full.max(dim=1).values, targets_full.mean(dim=1),], dim=-1,
-            )  # (B, 2C)
-
-            # normalize before MSE
-            student_global = F.layer_norm(student_global, student_global.shape[-1:])
-            teacher_global = F.layer_norm(teacher_global, teacher_global.shape[-1:])
-            global_mse_loss = F.mse_loss(student_global, teacher_global)
-
-            # -----------------------------------
+            cls_ce_loss = self.cls_distillation_loss(student_cls, teacher_cls)
 
             # --- Chamfer reconstruction loss (ALL tokens) ---  # recon_update_2
             B, T, C = embeddings.shape
@@ -315,65 +383,31 @@ class Point2Vec(pl.LightningModule):
                 gt_pts_f = gt_pts.float().contiguous()
                 dist1, dist2, _, _ = chamfer.forward(pred_pts_f, gt_pts_f)
                 recon_cd_loss = dist1.mean() + dist2.mean()
-            # -------------------------------------------------------
-
-            # ---------- TensorBoard point cloud logging (pred vs gt) ----------
-            log_every = 10000  # log every 10000 steps
-            if (
-                self.training
-                and self.logger is not None
-                and hasattr(self.logger, "experiment")
-                and (self.global_step % log_every == 0)
-            ):
-                try:
-                    writer = self.logger.experiment
-
-                    # log first sample in the batch
-                    pred0 = pred_pts[:1].detach().float().cpu()  # (1, P, 3)
-                    gt0 = gt_pts[:1].detach().float().cpu()      # (1, N, 3)
-
-                    # (optional) limit points to avoid huge logs
-                    Pmax = 4096
-                    if pred0.shape[1] > Pmax:
-                        pred0 = pred0[:, :Pmax, :]
-                    if gt0.shape[1] > Pmax:
-                        gt0 = gt0[:, :Pmax, :]
-
-                    # Use uint8 colors [0,255] to ensure TensorBoard shows colors correctly
-                    pred_col = torch.zeros_like(pred0, dtype=torch.uint8)
-                    pred_col[..., 0] = 255  # red
-                    gt_col = torch.full_like(gt0, 160, dtype=torch.uint8)  # grey
-
-                    writer.add_mesh("pc/pred", vertices=pred0, colors=pred_col, global_step=self.global_step)
-                    writer.add_mesh("pc/gt", vertices=gt0, colors=gt_col, global_step=self.global_step)
-
-                except Exception:
-                    pass
-            # ---------------------------------------------------------------------
+            vis_dict = {
+                "input_pts": points[:, :, :3],
+                "pred_pts": pred_pts.detach(),
+                "gt_pts": gt_pts.detach(),
+            }
+            # ------------------------------------------------------
 
         else:  # no decoder => like data2vec
             pos = self.positional_encoding(centers)
-            output_embeddings = self.student(
-                corrupted_embeddings, pos
-            ).last_hidden_state  # (B, T, C)
+            student_tokens, student_pos = self.append_cls_token(corrupted_embeddings, pos)
+            student_output = self.student(student_tokens, student_pos)
+            student_encoded = student_output.last_hidden_state
+            student_cls = student_encoded[:, 0]
+            output_embeddings = student_encoded[:, 1:]  # (B, T, C)
 
             predictions = self.regressor(output_embeddings[mask])
-            #targets = self.generate_targets(embeddings, pos)[mask]
-            targets_full = self.generate_targets(embeddings, pos)
+            # Update_3: use teacher cls token as the distillation target.
+            targets_full, teacher_cls = self.generate_targets(embeddings, pos)
             targets = targets_full[mask]
+            cls_ce_loss = self.cls_distillation_loss(student_cls, teacher_cls)
 
-            # global branch for no-decoder branch
-            student_global = torch.cat([output_embeddings.max(dim=1).values, output_embeddings.mean(dim=1),], dim=-1,
-            )
-            teacher_global = torch.cat([targets_full.max(dim=1).values, targets_full.mean(dim=1),], dim=-1,
-            )
-            student_global = F.layer_norm(student_global, student_global.shape[-1:])
-            teacher_global = F.layer_norm(teacher_global, teacher_global.shape[-1:])
-            global_mse_loss = F.mse_loss(student_global, teacher_global)
 
-        return predictions, targets, global_mse_loss, recon_cd_loss # update_2
+        return predictions, targets, cls_ce_loss, recon_cd_loss, vis_dict # update_2 # recon_update_3
 
-    def _perform_step(self, inputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:#, torch.Tensor, torch.Tensor]:
+    def _perform_step(self, inputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[Dict[str, torch.Tensor]]]:#, torch.Tensor, torch.Tensor]:
         # inputs: (B, N, 3)
         tokens, centers = self.tokenizer(inputs)  # (B, T, C), (B, T, 3)
         mask = self.masking(centers)  # (B, T)
@@ -384,23 +418,19 @@ class Point2Vec(pl.LightningModule):
         points, _ = batch
         points = self.train_transformations(points)
 
-        #---------recon_update_1: get recon_cd_loss from forward pass---------# #---------update_2: add global_mse_loss---------#
-        #x, y, recon_cd_loss = self._perform_step(points)
-        x, y, global_mse_loss, recon_cd_loss = self._perform_step(points)
-        #x, y, global_mse_loss = self._perform_step(points)
-        #x, y = self._perform_step(points)
+        # Update_3: combine original ssl loss with cls CE loss and reconstruction loss.
+        x, y, cls_ce_loss, recon_cd_loss, _ = self._perform_step(points)
         ssl_loss = self.loss_func(x, y)
-        #loss = ssl_loss + self.recon_cd_lambda * recon_cd_loss
-        loss = ssl_loss + self.global_mse_lambda * global_mse_loss + self.recon_cd_lambda * recon_cd_loss  # type: ignore
+        loss = ssl_loss + self.cls_ce_lambda * cls_ce_loss + self.recon_cd_lambda * recon_cd_loss  # type: ignore
 
 
-        self.log("train_ssl_loss", ssl_loss, on_step=True, on_epoch=True, prog_bar=True)
-        self.log("train_recon_cd_loss", recon_cd_loss, on_step=True, on_epoch=True, prog_bar=True)
-        self.log("train_global_mse_loss", global_mse_loss, on_step=True, on_epoch=True, prog_bar=True)
-        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log("train/ssl_loss", ssl_loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log("train/recon_cd_loss", recon_cd_loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log("train/cls_ce_loss", cls_ce_loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True)
 
-        self.log("train_pred_std", self.token_std(x))
-        self.log("train_target_std", self.token_std(y))
+        self.log("train/pred_std", self.token_std(x))
+        self.log("train/target_std", self.token_std(y))
         #-------------------------------------------------------------------------#
         return loss
 
@@ -411,22 +441,24 @@ class Point2Vec(pl.LightningModule):
         points, _ = batch
         points = self.val_transformations(points)
 
-        #---------recon_update_1: get recon_cd_loss from forward pass---------# #---------update_2: add global_mse_loss---------#
-        #x, y, recon_cd_loss  = self._perform_step(points)
-        x, y, global_mse_loss, recon_cd_loss = self._perform_step(points)
-        #x, y = self._perform_step(points)
-        #x, y, global_mse_loss = self._perform_step(points)
+        # Update_3: validate with the new cls-token distillation objective.
+        x, y, cls_ce_loss, recon_cd_loss, vis_dict = self._perform_step(points)
         ssl_loss = self.loss_func(x, y)
-        #loss = ssl_loss + self.recon_cd_lambda * recon_cd_loss
-        loss = ssl_loss + self.global_mse_lambda * global_mse_loss + self.recon_cd_lambda * recon_cd_loss  # type: ignore
+        loss = ssl_loss + self.cls_ce_lambda * cls_ce_loss + self.recon_cd_lambda * recon_cd_loss  # type: ignore
 
-        self.log("val_ssl_loss", ssl_loss, on_epoch=True, prog_bar=True)
-        self.log("val_recon_cd_loss", recon_cd_loss, on_epoch=True, prog_bar=True)
-        self.log("val_global_mse_loss", global_mse_loss, on_epoch=True, prog_bar=True)
-        self.log("val_loss", loss, on_epoch=True, prog_bar=True)
+        self.log("val/ssl_loss", ssl_loss, on_epoch=True, prog_bar=True)
+        self.log("val/recon_cd_loss", recon_cd_loss, on_epoch=True, prog_bar=True)
+        self.log("val/cls_ce_loss", cls_ce_loss, on_epoch=True, prog_bar=True)
+        self.log("val/loss", loss, on_epoch=True, prog_bar=True)
 
-        self.log("val_pred_std", self.token_std(x))
-        self.log("val_target_std", self.token_std(y))
+        self.log("val/pred_std", self.token_std(x))
+        self.log("val/target_std", self.token_std(y))
+        if batch_idx == 0 and vis_dict is not None:
+            self.log_point_clouds(
+                vis_dict["input_pts"],
+                vis_dict["pred_pts"],
+                vis_dict["gt_pts"],
+            )
         #-------------------------------------------------------------------------#
 
     def validation_epoch_end(
@@ -457,12 +489,20 @@ class Point2Vec(pl.LightningModule):
                 points = self.val_transformations(points)
                 embeddings, centers = self.tokenizer(points)
                 pos = self.positional_encoding(centers)
-                x = self.student(embeddings, pos).last_hidden_state
-                x = torch.cat([x.max(dim=1).values, x.mean(dim=1)], dim=-1)
+                # Update_3: mirror pretraining and use cls + mean + max pooled patch features.
+                tokens, pos = self.append_cls_token(embeddings, pos)
+                output = self.student(tokens, pos)
+                encoded = output.last_hidden_state
+                cls_feature = output.cls_hidden_state
+                assert cls_feature is not None
+                patch_tokens = encoded[:, 1:]
+                max_feature = patch_tokens.max(dim=1).values
+                mean_feature = patch_tokens.mean(dim=1)
+                x = torch.cat([cls_feature, max_feature, mean_feature], dim=-1)
                 x_list.append(x.cpu())
                 label_list.append(label.cpu())
 
-            x = torch.cat(x_list, dim=0)  # (N, 768)
+            x = torch.cat(x_list, dim=0)  # (N, 3C)
             y = torch.cat(label_list, dim=0)  # (N,)
             return x, y
 
@@ -488,11 +528,13 @@ class Point2Vec(pl.LightningModule):
         self,
         tokens: torch.Tensor,
         pos: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert self.teacher.ema_model is not None  # always false
         self.teacher.ema_model.eval()
         d2v_target_layers: List[int] = self.hparams.d2v_target_layers  # type: ignore
         d2v_target_layer_part: str = self.hparams.d2v_target_layer_part  # type: ignore
+        # Update_3: teacher sees full tokens with cls token for distillation.
+        tokens, pos = self.append_cls_token(tokens, pos)
         output: TransformerEncoderOutput = self.teacher(
             tokens,
             pos,
@@ -541,7 +583,7 @@ class Point2Vec(pl.LightningModule):
             raise ValueError()
 
         # Average top K blocks
-        targets = torch.stack(target_layers, dim=0).mean(0)  # (B, T, C)
+        targets = torch.stack(target_layers, dim=0).mean(0)  # (B, 1 + T, C)
 
         # post norm
 
@@ -562,7 +604,11 @@ class Point2Vec(pl.LightningModule):
         elif target_norm is not None:
             raise ValueError()
 
-        return targets
+        # Update_3: split cls token from patch tokens after target normalization.
+        teacher_cls = F.layer_norm(targets[:, 0], targets[:, 0].shape[-1:])
+        targets = targets[:, 1:]
+
+        return targets, teacher_cls
 
     @staticmethod
     def token_std(tokens: torch.Tensor) -> torch.Tensor:
