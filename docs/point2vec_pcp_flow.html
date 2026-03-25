@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Point2Vec vs Point2VecPCP</title>
+  <style>
+    :root {
+      --bg: #f4efe8;
+      --paper: #fffaf4;
+      --ink: #1f2933;
+      --muted: #52606d;
+      --border: #d9cbb8;
+      --accent-a: #d97706;
+      --accent-b: #0f766e;
+      --accent-c: #b45309;
+      --soft-a: #fff0d9;
+      --soft-b: #ddf7f3;
+      --soft-c: #f7e6cc;
+      --shadow: 0 16px 40px rgba(90, 62, 33, 0.12);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", serif;
+      background:
+        radial-gradient(circle at top left, rgba(217, 119, 6, 0.09), transparent 28%),
+        radial-gradient(circle at top right, rgba(15, 118, 110, 0.12), transparent 26%),
+        linear-gradient(180deg, #f7f1e8 0%, var(--bg) 100%);
+      color: var(--ink);
+    }
+
+    .page {
+      max-width: 1500px;
+      margin: 0 auto;
+      padding: 36px 28px 48px;
+    }
+
+    .hero {
+      display: grid;
+      gap: 14px;
+      margin-bottom: 28px;
+    }
+
+    .eyebrow {
+      display: inline-block;
+      width: fit-content;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: rgba(31, 41, 51, 0.08);
+      color: var(--muted);
+      font-size: 13px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(34px, 5vw, 56px);
+      line-height: 0.95;
+      letter-spacing: -0.04em;
+    }
+
+    .subtitle {
+      max-width: 900px;
+      color: var(--muted);
+      font-size: 18px;
+      line-height: 1.55;
+      margin: 0;
+    }
+
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 8px;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.72);
+      font-size: 14px;
+      color: var(--muted);
+    }
+
+    .swatch {
+      width: 12px;
+      height: 12px;
+      border-radius: 999px;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 22px;
+      align-items: start;
+    }
+
+    .panel {
+      background: linear-gradient(180deg, rgba(255, 250, 244, 0.98), rgba(255, 248, 239, 0.95));
+      border: 1px solid var(--border);
+      border-radius: 28px;
+      padding: 22px;
+      box-shadow: var(--shadow);
+      position: relative;
+      overflow: hidden;
+    }
+
+    .panel::before {
+      content: "";
+      position: absolute;
+      inset: 0 auto auto 0;
+      width: 100%;
+      height: 6px;
+      background: linear-gradient(90deg, rgba(217, 119, 6, 0.95), rgba(15, 118, 110, 0.6));
+    }
+
+    .panel.pcp::before {
+      background: linear-gradient(90deg, rgba(15, 118, 110, 0.95), rgba(217, 119, 6, 0.55));
+    }
+
+    .panel-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 16px;
+      margin-bottom: 18px;
+    }
+
+    .panel-title {
+      margin: 0;
+      font-size: 30px;
+      letter-spacing: -0.04em;
+    }
+
+    .panel-text {
+      margin: 6px 0 0;
+      color: var(--muted);
+      line-height: 1.5;
+      font-size: 16px;
+    }
+
+    .tag {
+      flex-shrink: 0;
+      border-radius: 999px;
+      padding: 8px 12px;
+      font-size: 13px;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      border: 1px solid var(--border);
+    }
+
+    .tag.original {
+      background: var(--soft-a);
+      color: var(--accent-c);
+    }
+
+    .tag.pcp {
+      background: var(--soft-b);
+      color: var(--accent-b);
+    }
+
+    .flow {
+      display: grid;
+      gap: 14px;
+    }
+
+    .step {
+      border: 1px solid var(--border);
+      border-radius: 22px;
+      background: rgba(255, 255, 255, 0.74);
+      padding: 16px 18px;
+      position: relative;
+    }
+
+    .step.input {
+      background: linear-gradient(180deg, #fff7ec, #fff1dd);
+    }
+
+    .step.student {
+      background: linear-gradient(180deg, #eef8f7, #def4f1);
+    }
+
+    .step.decoder {
+      background: linear-gradient(180deg, #fff8ef, #fce8d1);
+    }
+
+    .step.teacher {
+      background: linear-gradient(180deg, #f2f4f8, #e7ebf0);
+    }
+
+    .step.loss {
+      background: linear-gradient(180deg, #eefcf7, #def7ee);
+    }
+
+    .step.pcp-highlight {
+      border-width: 2px;
+      border-color: rgba(15, 118, 110, 0.35);
+      background: linear-gradient(180deg, #ebfbf8, #d7f5ef);
+    }
+
+    .step-title {
+      margin: 0 0 8px;
+      font-size: 20px;
+      letter-spacing: -0.03em;
+    }
+
+    .shape {
+      display: inline-block;
+      margin: 0 0 10px;
+      padding: 5px 10px;
+      border-radius: 999px;
+      background: rgba(31, 41, 51, 0.08);
+      color: var(--muted);
+      font-size: 13px;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    }
+
+    .step p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.55;
+      font-size: 15px;
+    }
+
+    .arrow {
+      height: 16px;
+      position: relative;
+    }
+
+    .arrow::before {
+      content: "";
+      position: absolute;
+      left: 50%;
+      top: 0;
+      width: 2px;
+      height: 16px;
+      background: linear-gradient(180deg, rgba(31, 41, 51, 0.18), rgba(31, 41, 51, 0.55));
+      transform: translateX(-50%);
+    }
+
+    .arrow::after {
+      content: "";
+      position: absolute;
+      left: 50%;
+      bottom: -1px;
+      width: 10px;
+      height: 10px;
+      border-right: 2px solid rgba(31, 41, 51, 0.55);
+      border-bottom: 2px solid rgba(31, 41, 51, 0.55);
+      transform: translateX(-50%) rotate(45deg);
+      background: transparent;
+    }
+
+    .comparison {
+      margin-top: 24px;
+      border: 1px solid var(--border);
+      border-radius: 24px;
+      background: rgba(255, 255, 255, 0.76);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 15px;
+    }
+
+    th, td {
+      text-align: left;
+      padding: 16px 18px;
+      vertical-align: top;
+      border-bottom: 1px solid rgba(217, 203, 184, 0.8);
+    }
+
+    th {
+      background: rgba(31, 41, 51, 0.05);
+      font-size: 13px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    tr:last-child td {
+      border-bottom: none;
+    }
+
+    .good {
+      color: var(--accent-b);
+      font-weight: 600;
+    }
+
+    .warn {
+      color: var(--accent-c);
+      font-weight: 600;
+    }
+
+    code {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: 0.92em;
+      background: rgba(31, 41, 51, 0.06);
+      padding: 2px 6px;
+      border-radius: 6px;
+    }
+
+    @media (max-width: 1100px) {
+      .layout {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="hero">
+      <span class="eyebrow">Architecture Visualization</span>
+      <h1>Point2Vec vs Point2VecPCP</h1>
+      <p class="subtitle">
+        A side-by-side HTML diagram of how the original Point2Vec pretraining path differs from the PCP-style variant.
+        The key change is that Point2VecPCP predicts the masked positional embedding first, then feeds the predicted
+        position into the decoder instead of using the ground-truth masked position directly.
+      </p>
+      <div class="legend">
+        <span class="pill"><span class="swatch" style="background: #f4b860;"></span>Input / grouping</span>
+        <span class="pill"><span class="swatch" style="background: #75cfc4;"></span>Student / PCP branch</span>
+        <span class="pill"><span class="swatch" style="background: #efc27f;"></span>Decoder / reconstruction</span>
+        <span class="pill"><span class="swatch" style="background: #cad3dd;"></span>Teacher targets</span>
+        <span class="pill"><span class="swatch" style="background: #9edab9;"></span>Losses</span>
+      </div>
+    </section>
+
+    <section class="layout">
+      <article class="panel">
+        <header class="panel-header">
+          <div>
+            <h2 class="panel-title">Original Point2Vec</h2>
+            <p class="panel-text">
+              Decoder receives the ground-truth masked positional embedding. This makes reconstruction easier,
+              but it also means the encoder is not forced to infer masked geometry as strongly.
+            </p>
+          </div>
+          <span class="tag original">Baseline</span>
+        </header>
+
+        <div class="flow">
+          <section class="step input">
+            <h3 class="step-title">1. Tokenize Point Cloud</h3>
+            <span class="shape">points: (B, N, 3)</span>
+            <p>
+              <code>tokenizer(points)</code> produces patch tokens and patch centers:
+              <code>embeddings: (B, T, C)</code>, <code>centers: (B, T, 3)</code>.
+              Then <code>masking(centers)</code> selects visible and masked patches.
+            </p>
+          </section>
+
+          <div class="arrow"></div>
+
+          <section class="step student">
+            <h3 class="step-title">2. Student Sees Only Visible Patches</h3>
+            <span class="shape">visible_embeddings, visible_pos</span>
+            <p>
+              Visible tokens are concatenated with a class token and encoded by the student transformer.
+              The student returns visible patch features and a global class feature <code>student_cls</code>.
+            </p>
+          </section>
+
+          <div class="arrow"></div>
+
+          <section class="step decoder">
+            <h3 class="step-title">3. Decoder Uses Ground-Truth Masked Position</h3>
+            <span class="shape">decoder pos = [visible_pos ; masked_pos]</span>
+            <p>
+              The masked branch is reconstructed with decoder inputs formed from visible encoded tokens,
+              masked placeholder tokens, and the real masked positional embedding from
+              <code>positional_encoding(centers)</code>.
+            </p>
+          </section>
+
+          <div class="arrow"></div>
+
+          <section class="step teacher">
+            <h3 class="step-title">4. Teacher Builds Token Targets</h3>
+            <span class="shape">targets_full: (B, T, C)</span>
+            <p>
+              The EMA teacher sees the full token sequence and produces regression targets.
+              The masked subset becomes the target for <code>ssl_loss</code>.
+            </p>
+          </section>
+
+          <div class="arrow"></div>
+
+          <section class="step loss">
+            <h3 class="step-title">5. Losses</h3>
+            <p>
+              Total loss:
+              <br>
+              <code>ssl_loss + cls_ce_lambda * cls_ce_loss</code>
+              <br><br>
+              There is no explicit objective forcing the model to predict masked geometry before decoding.
+            </p>
+          </section>
+        </div>
+      </article>
+
+      <article class="panel pcp">
+        <header class="panel-header">
+          <div>
+            <h2 class="panel-title">Point2VecPCP</h2>
+            <p class="panel-text">
+              A PCP-style positional prediction branch is inserted before the decoder.
+              The decoder now consumes predicted masked position instead of the ground-truth masked position.
+            </p>
+          </div>
+          <span class="tag pcp">PCP Variant</span>
+        </header>
+
+        <div class="flow">
+          <section class="step input">
+            <h3 class="step-title">1. Tokenize Point Cloud</h3>
+            <span class="shape">points: (B, N, 3)</span>
+            <p>
+              Same start as the baseline:
+              <code>tokenizer(points)</code> gives <code>embeddings</code> and <code>centers</code>,
+              then <code>masking(centers)</code> splits patches into visible and masked sets.
+            </p>
+          </section>
+
+          <div class="arrow"></div>
+
+          <section class="step student">
+            <h3 class="step-title">2. Student Encodes Visible Patches</h3>
+            <span class="shape">output_embeddings, student_cls</span>
+            <p>
+              The visible branch stays the same as the original Point2Vec path.
+              This keeps the main encoder design unchanged while adding a new auxiliary geometric task.
+            </p>
+          </section>
+
+          <div class="arrow"></div>
+
+          <section class="step pcp-highlight">
+            <h3 class="step-title">3. New PCP Branch Predicts Masked Position</h3>
+            <span class="shape">[visible_pos ; mask_pos_token] -> pos_decoder -> pred_pos_proj</span>
+            <p>
+              A dedicated positional branch uses a learnable <code>mask_pos_token</code> instead of the true masked
+              position. The branch outputs <code>predicted_masked_pos</code>, which is trained to match the real
+              masked positional embedding.
+            </p>
+          </section>
+
+          <div class="arrow"></div>
+
+          <section class="step decoder">
+            <h3 class="step-title">4. Decoder Uses Predicted Masked Position</h3>
+            <span class="shape">decoder pos = [visible_pos ; predicted_masked_pos.detach()]</span>
+            <p>
+              The decoder now reconstructs masked token targets using inferred position rather than the ground-truth
+              masked position. By default, the predicted position is detached before decoder input for training stability.
+            </p>
+          </section>
+
+          <div class="arrow"></div>
+
+          <section class="step teacher">
+            <h3 class="step-title">5. Teacher Still Provides Token Targets</h3>
+            <span class="shape">targets_full: (B, T, C)</span>
+            <p>
+              The EMA teacher path remains unchanged. This preserves the original masked token regression objective
+              while adding a new geometric bottleneck before reconstruction.
+            </p>
+          </section>
+
+          <div class="arrow"></div>
+
+          <section class="step loss">
+            <h3 class="step-title">6. Losses</h3>
+            <p>
+              Total loss:
+              <br>
+              <code>ssl_loss + cls_ce_lambda * cls_ce_loss + pcp_pos_prediction_lambda * pos_loss</code>
+              <br><br>
+              New term:
+              <code>pos_loss = distance(predicted_masked_pos, masked_pos)</code>
+            </p>
+          </section>
+        </div>
+      </article>
+    </section>
+
+    <section class="comparison">
+      <table>
+        <thead>
+          <tr>
+            <th>Aspect</th>
+            <th>Original Point2Vec</th>
+            <th>Point2VecPCP</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Masked positional input to decoder</td>
+            <td><span class="warn">Ground-truth masked pos</span></td>
+            <td><span class="good">Predicted masked pos</span></td>
+          </tr>
+          <tr>
+            <td>Extra branch</td>
+            <td>None</td>
+            <td><code>mask_pos_token -> pos_decoder -> pred_pos_proj</code></td>
+          </tr>
+          <tr>
+            <td>New loss term</td>
+            <td>No</td>
+            <td><code>pos_loss</code></td>
+          </tr>
+          <tr>
+            <td>What the new branch encourages</td>
+            <td>Reconstruct masked token target directly</td>
+            <td>Infer masked geometry first, then reconstruct</td>
+          </tr>
+          <tr>
+            <td>Expected effect</td>
+            <td>Decoder can rely more on explicit geometry</td>
+            <td>Encoder is pushed to learn stronger geometric representations</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+  </main>
+</body>
+</html>
