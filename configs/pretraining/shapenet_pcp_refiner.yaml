@@ -17,7 +17,7 @@ model:
   encoder_attention_dropout: 0.05
   encoder_drop_path_rate: 0.25
   encoder_add_pos_at_every_layer: true
-  decoder: true
+  decoder: false
   decoder_depth: 4
   decoder_dropout: 0.0
   decoder_attention_dropout: 0.05
@@ -57,13 +57,13 @@ model:
   transformation_rotate_degs: null
   transformation_translate: 0.2
   transformation_height_normalize_dim: 1
-  pcp_pos_decoder_depth: 2
-  pcp_pos_decoder_dropout: 0.0
-  pcp_pos_decoder_attention_dropout: 0.05
-  pcp_pos_decoder_drop_path_rate: 0.1
-  pcp_pos_prediction_lambda: 1.0
+  pcp_pos_prediction_lambda: 0.1
   pcp_pos_prediction_loss: mse
   pcp_detach_predicted_pos: true
+  pcp_refinement_depth: 4
+  pcp_refinement_dropout: 0.0
+  pcp_refinement_attention_dropout: 0.05
+  pcp_refinement_drop_path_rate: 0.1
   svm_validation:
     modelnet40:
       class_path: point2vec.datasets.ModelNet40Ply2048DataModule
