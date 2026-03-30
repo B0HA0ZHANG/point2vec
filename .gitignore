@@ -175,4 +175,5 @@ pyrightconfig.json
 point2vec-Pretraining-ShapeNet/
 point2vec-Classification-ScanObjectNN/
 point2vec-Pretraining-ShapeNet-PCP/
+point2vec-Pretraining-ShapeNet-PCP-Refiner/
 *.ckpt

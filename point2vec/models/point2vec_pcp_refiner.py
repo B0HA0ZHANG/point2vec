@@ -132,12 +132,8 @@ class Point2VecPCPRefiner(Point2Vec):
 
         init_std = 0.02
         self.mask_query_token = nn.Parameter(torch.zeros(encoder_dim))
-        self.mask_pos_token = nn.Parameter(torch.zeros(encoder_dim))
         nn.init.trunc_normal_(
             self.mask_query_token, mean=0, std=init_std, a=-init_std, b=init_std
-        )
-        nn.init.trunc_normal_(
-            self.mask_pos_token, mean=0, std=init_std, a=-init_std, b=init_std
         )
 
         dpr = [
@@ -182,7 +178,9 @@ class Point2VecPCPRefiner(Point2Vec):
         masked_queries = self.mask_query_token.reshape(1, 1, C).expand(
             B, num_masked, -1
         )
-        masked_query_pos = self.mask_pos_token.reshape(1, 1, C).expand(B, num_masked, -1)
+        # Use the true masked centers as query identities so each masked slot is
+        # tied to a specific missing patch rather than sharing one symmetric slot.
+        masked_query_pos = masked_pos
 
         student_tokens, student_pos = self.append_cls_token(
             visible_embeddings,
